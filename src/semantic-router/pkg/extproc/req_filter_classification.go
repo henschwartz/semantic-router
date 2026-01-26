@@ -3,9 +3,12 @@ package extproc
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/selection"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/entropy"
 )
@@ -45,8 +48,30 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 		return "", 0.0, entropy.ReasoningDecision{}, ""
 	}
 
+	// For context token counting, we need to include ALL messages (user + non-user)
+	// This ensures multi-turn conversations are properly counted
+	var allMessagesText string
+	if userContent != "" && len(nonUserMessages) > 0 {
+		// Combine user content with all non-user messages for full context
+		allMessages := make([]string, 0, len(nonUserMessages)+1)
+		allMessages = append(allMessages, nonUserMessages...)
+		allMessages = append(allMessages, userContent)
+		allMessagesText = strings.Join(allMessages, " ")
+	} else if userContent != "" {
+		allMessagesText = userContent
+	} else {
+		allMessagesText = strings.Join(nonUserMessages, " ")
+	}
+
+	// Start signal evaluation span (Layer 1)
+	signalStart := time.Now()
+	signalCtx, signalSpan := tracing.StartSpan(ctx.TraceContext, tracing.SpanSignalEvaluation)
+
 	// Evaluate all signals first to get detailed signal information
-	signals := r.Classifier.EvaluateAllSignals(evaluationText)
+	// Use evaluationText for most signals, but pass allMessagesText for context counting
+	signals := r.Classifier.EvaluateAllSignalsWithContext(evaluationText, allMessagesText)
+
+	signalLatency := time.Since(signalStart).Milliseconds()
 
 	// Store signal results in context for response headers
 	ctx.VSRMatchedKeywords = signals.MatchedKeywordRules
@@ -56,15 +81,33 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 	ctx.VSRMatchedUserFeedback = signals.MatchedUserFeedbackRules
 	ctx.VSRMatchedPreference = signals.MatchedPreferenceRules
 	ctx.VSRMatchedLanguage = signals.MatchedLanguageRules
+	ctx.VSRMatchedLatency = signals.MatchedLatencyRules
+	ctx.VSRMatchedContext = signals.MatchedContextRules
+	ctx.VSRContextTokenCount = signals.TokenCount
 
 	// Set fact-check context fields from signal results
 	// This replaces the old performFactCheckClassification call to avoid duplicate computation
 	r.setFactCheckFromSignals(ctx, signals.MatchedFactCheckRules)
 
 	// Log signal evaluation results
-	logging.Infof("Signal evaluation results: keyword=%v, embedding=%v, domain=%v, fact_check=%v, user_feedback=%v, preference=%v, language=%v",
+	logging.Infof("Signal evaluation results: keyword=%v, embedding=%v, domain=%v, fact_check=%v, user_feedback=%v, preference=%v, language=%v, latency=%v",
 		signals.MatchedKeywordRules, signals.MatchedEmbeddingRules, signals.MatchedDomainRules,
-		signals.MatchedFactCheckRules, signals.MatchedUserFeedbackRules, signals.MatchedPreferenceRules, signals.MatchedLanguageRules)
+		signals.MatchedFactCheckRules, signals.MatchedUserFeedbackRules, signals.MatchedPreferenceRules, signals.MatchedLanguageRules, signals.MatchedLatencyRules)
+
+	// Set signal span attributes
+	allMatchedRules := []string{}
+	allMatchedRules = append(allMatchedRules, signals.MatchedKeywordRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedEmbeddingRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedDomainRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedFactCheckRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedUserFeedbackRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedPreferenceRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedLanguageRules...)
+	allMatchedRules = append(allMatchedRules, signals.MatchedLatencyRules...)
+
+	// End signal evaluation span
+	tracing.EndSignalSpan(signalSpan, allMatchedRules, 1.0, signalLatency)
+	ctx.TraceContext = signalCtx
 
 	// Process user feedback signals to automatically update Elo ratings
 	// This implements "automatic scoring by signals" as requested
@@ -73,9 +116,22 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 	// Perform decision evaluation using pre-computed signals
 	// This is ALWAYS done when decisions are configured, regardless of model type,
 	// because plugins (e.g., hallucination detection) depend on the matched decision
+
+	// Start decision evaluation span (Layer 2)
+	decisionStart := time.Now()
+	decisionCtx, decisionSpan := tracing.StartDecisionSpan(ctx.TraceContext, "decision_evaluation")
+
 	result, err := r.Classifier.EvaluateDecisionWithEngine(signals)
+	decisionLatency := time.Since(decisionStart).Seconds()
+
+	// Record decision evaluation metrics
+	metrics.RecordDecisionEvaluation(decisionLatency)
+
 	if err != nil {
 		logging.Errorf("Decision evaluation error: %v", err)
+		// End decision span with error
+		tracing.EndDecisionSpan(decisionSpan, 0.0, []string{}, r.Config.Strategy)
+		ctx.TraceContext = decisionCtx
 		if r.Config.IsAutoModelName(originalModel) {
 			return "", 0.0, entropy.ReasoningDecision{}, r.Config.DefaultModel
 		}
@@ -83,11 +139,21 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 	}
 
 	if result == nil || result.Decision == nil {
+		// End decision span with no match
+		tracing.EndDecisionSpan(decisionSpan, 0.0, []string{}, r.Config.Strategy)
+		ctx.TraceContext = decisionCtx
 		if r.Config.IsAutoModelName(originalModel) {
 			return "", 0.0, entropy.ReasoningDecision{}, r.Config.DefaultModel
 		}
 		return "", 0.0, entropy.ReasoningDecision{}, ""
 	}
+
+	// Record decision match with confidence
+	metrics.RecordDecisionMatch(result.Decision.Name, result.Confidence)
+
+	// End decision span with success
+	tracing.EndDecisionSpan(decisionSpan, result.Confidence, result.MatchedRules, r.Config.Strategy)
+	ctx.TraceContext = decisionCtx
 
 	// Store the selected decision in context for later use (e.g., plugins, header mutations)
 	// This is critical for hallucination detection and other per-decision plugins
@@ -113,8 +179,9 @@ func (r *OpenAIRouter) performDecisionEvaluation(originalModel string, userConte
 	ctx.VSRSelectedCategory = categoryName
 	ctx.VSRSelectedDecisionConfidence = evaluationConfidence
 
-	// Store matched keywords in context for response headers
-	ctx.VSRMatchedKeywords = result.MatchedKeywords
+	// Note: VSRMatchedKeywords is already set from signals.MatchedKeywordRules (line 61)
+	// We should NOT overwrite it with result.MatchedKeywords which contains actual keywords
+	// The header should show rule names, not the actual matched keywords
 
 	decisionName = result.Decision.Name
 	evaluationConfidence = result.Confidence

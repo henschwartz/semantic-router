@@ -6,7 +6,6 @@ import ViewModal, { ViewSection } from '../components/ViewModal'
 import { DataTable, Column } from '../components/DataTable'
 import TableHeader from '../components/TableHeader'
 import EndpointsEditor, { Endpoint } from '../components/EndpointsEditor'
-import ReadonlyBanner from '../components/ReadonlyBanner'
 import { useReadonly } from '../contexts/ReadonlyContext'
 import {
   ConfigFormat,
@@ -164,6 +163,8 @@ interface ConfigData {
     user_feedbacks?: Array<{ name: string; description: string }>
     preferences?: Array<{ name: string; description: string }>
     language?: Array<{ name: string }>
+    latency?: Array<{ name: string; max_tpot?: number; description?: string }>
+    context?: Array<{ name: string; min_tokens: string; max_tokens: string; description?: string }>
   }
   decisions?: Array<{
     name: string
@@ -236,7 +237,7 @@ interface ConfigPageProps {
   activeSection?: ConfigSection
 }
 
-type SignalType = 'Keywords' | 'Embeddings' | 'Domain' | 'Preference' | 'Fact Check' | 'User Feedback' | 'Language'
+type SignalType = 'Keywords' | 'Embeddings' | 'Domain' | 'Preference' | 'Fact Check' | 'User Feedback' | 'Language' | 'Latency' | 'Context'
 type DecisionConfig = NonNullable<ConfigData['decisions']>[number]
 
 interface DecisionFormState {
@@ -260,6 +261,9 @@ interface AddSignalFormState {
   candidates: string
   aggregation_method: string
   mmlu_categories: string
+  max_tpot?: number
+  min_tokens?: string
+  max_tokens?: string
 }
 
 // Helper function to format threshold as percentage
@@ -475,6 +479,15 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         break
       case 'User Feedback':
         cfg.signals.user_feedbacks = (cfg.signals.user_feedbacks || []).filter(s => s.name !== targetName)
+        break
+      case 'Language':
+        cfg.signals.language = (cfg.signals.language || []).filter(s => s.name !== targetName)
+        break
+      case 'Latency':
+        cfg.signals.latency = (cfg.signals.latency || []).filter(s => s.name !== targetName)
+        break
+      case 'Context':
+        cfg.signals.context = (cfg.signals.context || []).filter(s => s.name !== targetName)
         break
       default:
         break
@@ -2201,6 +2214,26 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
       })
     })
 
+    // Latency
+    signals?.latency?.forEach(lat => {
+      allSignals.push({
+        name: lat.name,
+        type: 'Latency',
+        summary: `Max TPOT: ${lat.max_tpot}s`,
+        rawData: lat
+      })
+    })
+
+    // Context
+    signals?.context?.forEach(ctx => {
+      allSignals.push({
+        name: ctx.name,
+        type: 'Context',
+        summary: `${ctx.min_tokens} to ${ctx.max_tokens} tokens`,
+        rawData: ctx
+      })
+    })
+
     // Filter signals based on search
     const filteredSignals = allSignals.filter(signal =>
       signal.name.toLowerCase().includes(signalsSearch.toLowerCase()) ||
@@ -2229,7 +2262,9 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             'Preference': 'rgba(234, 179, 8, 0.15)',
             'Fact Check': 'rgba(34, 197, 94, 0.15)',
             'User Feedback': 'rgba(236, 72, 153, 0.15)',
-            'Language': 'rgba(59, 130, 246, 0.15)'
+            'Language': 'rgba(59, 130, 246, 0.15)',
+            'Latency': 'rgba(168, 85, 247, 0.15)',
+            'Context': 'rgba(251, 146, 60, 0.15)'
           }
           return (
             <span className={styles.badge} style={{ background: typeColors[row.type] }}>
@@ -2349,6 +2384,22 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             }
           ]
         })
+      } else if (signal.type === 'Language') {
+        sections.push({
+          title: 'Language Signal',
+          fields: [
+            { label: 'Language Code', value: signal.rawData.name || 'N/A', fullWidth: true },
+            { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+          ]
+        })
+      } else if (signal.type === 'Latency') {
+        sections.push({
+          title: 'Latency Signal',
+          fields: [
+            { label: 'Max TPOT', value: signal.rawData.max_tpot ? `${signal.rawData.max_tpot}s (${(signal.rawData.max_tpot * 1000).toFixed(0)}ms per token)` : 'N/A', fullWidth: true },
+            { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+          ]
+        })
       } else {
         // Preference, Fact Check, User Feedback
         sections.push({
@@ -2377,7 +2428,10 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         threshold: 0.8,
         candidates: '',
         aggregation_method: 'mean',
-        mmlu_categories: ''
+        mmlu_categories: '',
+        max_tpot: 0.05,
+        min_tokens: '0',
+        max_tokens: '8K'
       }
 
       const initialData: AddSignalFormState = mode === 'edit' && signal ? {
@@ -2390,7 +2444,10 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         threshold: signal.rawData.threshold ?? 0.8,
         candidates: (signal.rawData.candidates || []).join('\n'),
         aggregation_method: signal.rawData.aggregation_method || 'mean',
-        mmlu_categories: (signal.rawData.mmlu_categories || []).join('\n')
+        mmlu_categories: (signal.rawData.mmlu_categories || []).join('\n'),
+        max_tpot: signal.rawData.max_tpot ?? 0.05,
+        min_tokens: signal.rawData.min_tokens || '0',
+        max_tokens: signal.rawData.max_tokens || '8K'
       } : defaultForm
 
 
@@ -2458,12 +2515,45 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           shouldHide: conditionallyHideFieldExceptType('Domain')
         }
       ]
+
+      const latencyFields: FieldConfig[] = [
+        {
+          name: 'max_tpot',
+          label: 'Max TPOT (latency only)',
+          type: 'number',
+          min: 0,
+          step: 0.001,
+          placeholder: '0.05',
+          description: 'Maximum Time Per Output Token in seconds (e.g., 0.05 = 50ms per token)',
+          shouldHide: conditionallyHideFieldExceptType('Latency')
+        }
+      ]
+
+      const contextFields: FieldConfig[] = [
+        {
+          name: 'min_tokens',
+          label: 'Minimum Tokens (context only)',
+          type: 'text',
+          placeholder: 'e.g., 0, 8K, 1M',
+          description: 'Minimum token count (supports K/M suffixes)',
+          shouldHide: conditionallyHideFieldExceptType('Context')
+        },
+        {
+          name: 'max_tokens',
+          label: 'Maximum Tokens (context only)',
+          type: 'text',
+          placeholder: 'e.g., 8K, 1024K',
+          description: 'Maximum token count (supports K/M suffixes)',
+          shouldHide: conditionallyHideFieldExceptType('Context')
+        }
+      ]
+
       const fields: FieldConfig[] = [
         {
           name: 'type',
           label: 'Type',
           type: 'select',
-          options: ['Keywords', 'Embeddings', 'Domain', 'Preference', 'Fact Check', 'User Feedback'],
+          options: ['Keywords', 'Embeddings', 'Domain', 'Preference', 'Fact Check', 'User Feedback', 'Language', 'Latency', 'Context'],
           required: true,
           description: 'Fields are validated based on the selected type.'
         },
@@ -2483,6 +2573,8 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         ...keywordFields,
         ...embeddingFields,
         ...domainFields,
+        ...latencyFields,
+        ...contextFields,
       ]
 
       const saveSignal = async (formData: AddSignalFormState) => {
@@ -2586,6 +2678,47 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
               {
                 name,
                 description: formData.description
+              }
+            ]
+            break
+          }
+          case 'Language': {
+            newConfig.signals.language = [
+              ...(newConfig.signals.language || []),
+              {
+                name
+              }
+            ]
+            break
+          }
+          case 'Latency': {
+            const max_tpot = formData.max_tpot ?? 0.05
+            if (max_tpot <= 0) {
+              throw new Error('Max TPOT must be greater than 0.')
+            }
+            newConfig.signals.latency = [
+              ...(newConfig.signals.latency || []),
+              {
+                name,
+                max_tpot,
+                description: formData.description || undefined
+              }
+            ]
+            break
+          }
+          case 'Context': {
+            const min_tokens = (formData.min_tokens || '0').trim()
+            const max_tokens = (formData.max_tokens || '8K').trim()
+            if (!min_tokens || !max_tokens) {
+              throw new Error('Both min_tokens and max_tokens are required.')
+            }
+            newConfig.signals.context = [
+              ...(newConfig.signals.context || []),
+              {
+                name,
+                min_tokens,
+                max_tokens,
+                description: formData.description || undefined
               }
             ]
             break
@@ -2808,7 +2941,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
     const openDecisionEditor = (mode: 'add' | 'edit', decision?: DecisionRow) => {
       setViewModalOpen(false)
-      const conditionTypeOptions = ['keyword', 'domain', 'preference', 'user_feedback', 'embedding'] as const
+      const conditionTypeOptions = ['keyword', 'domain', 'preference', 'user_feedback', 'embedding', 'language', 'latency'] as const
 
       const getConditionNameOptions = (type?: DecisionConditionType) => {
         // derive condition name options based on signals configured
@@ -2823,8 +2956,10 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             return config?.signals?.user_feedbacks?.map((u) => u.name) || []
           case 'embedding':
             return config?.signals?.embeddings?.map((e) => e.name) || []
+          case 'latency':
+            return config?.signals?.latency?.map((l) => l.name) || []
           default:
-            return ["ABC"]
+            return []
         }
       }
 
@@ -4083,8 +4218,6 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
   return (
     <div className={styles.container}>
-      <ReadonlyBanner />
-
       <div className={styles.content}>
         {loading && (
           <div className={styles.loading}>
@@ -4125,7 +4258,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
       <ViewModal
         isOpen={viewModalOpen}
         onClose={handleCloseViewModal}
-        onEdit={viewModalEditCallback || undefined}
+        onEdit={isReadonly ? undefined : (viewModalEditCallback || undefined)}
         title={viewModalTitle}
         sections={viewModalSections}
       />
