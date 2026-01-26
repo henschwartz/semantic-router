@@ -269,6 +269,12 @@ type Classifier struct {
 	// Language classifier
 	languageClassifier *LanguageClassifier
 
+	// Latency classifier
+	latencyClassifier *LatencyClassifier
+
+	// Context classifier for token count-based routing
+	contextClassifier *ContextClassifier
+
 	Config           *config.RouterConfig
 	CategoryMapping  *CategoryMapping
 	PIIMapping       *PIIMapping
@@ -320,6 +326,12 @@ func withKeywordEmbeddingClassifier(keywordEmbeddingInitializer EmbeddingClassif
 	}
 }
 
+func withContextClassifier(contextClassifier *ContextClassifier) option {
+	return func(c *Classifier) {
+		c.contextClassifier = contextClassifier
+	}
+}
+
 // initModels initializes the models for the classifier
 func initModels(classifier *Classifier) (*Classifier, error) {
 	// Initialize either in-tree OR MCP-based category classifier
@@ -349,6 +361,11 @@ func initModels(classifier *Classifier) (*Classifier, error) {
 		if err := classifier.initializeKeywordEmbeddingClassifier(); err != nil {
 			return nil, err
 		}
+	}
+
+	// Initialize context classifier (no external model init needed, but good to log)
+	if classifier.contextClassifier != nil {
+		logging.Infof("Context classifier initialized with %d rules", len(classifier.contextClassifier.rules))
 	}
 
 	// Initialize hallucination mitigation classifiers
@@ -385,6 +402,14 @@ func initModels(classifier *Classifier) (*Classifier, error) {
 		if err := classifier.initializeLanguageClassifier(); err != nil {
 			logging.Warnf("Failed to initialize language classifier: %v", err)
 			// Non-fatal - continue without language classification
+		}
+	}
+
+	// Initialize latency classifier
+	if len(classifier.Config.LatencyRules) > 0 {
+		if err := classifier.initializeLatencyClassifier(); err != nil {
+			logging.Warnf("Failed to initialize latency classifier: %v", err)
+			// Non-fatal - continue without latency classification
 		}
 	}
 
@@ -452,6 +477,14 @@ func NewClassifier(cfg *config.RouterConfig, categoryMapping *CategoryMapping, p
 			return nil, err
 		}
 		options = append(options, withKeywordEmbeddingClassifier(createEmbeddingInitializer(), keywordEmbeddingClassifier))
+	}
+
+	// Add context classifier if configured
+	if len(cfg.ContextRules) > 0 {
+		// Create token counter (uses character-based heuristic for performance)
+		tokenCounter := &CharacterBasedTokenCounter{}
+		contextClassifier := NewContextClassifier(tokenCounter, cfg.ContextRules)
+		options = append(options, withContextClassifier(contextClassifier))
 	}
 
 	// Add in-tree classifier if configured
@@ -557,10 +590,7 @@ func (c *Classifier) CheckForJailbreakWithThreshold(text string, threshold float
 	var result candle_binding.ClassResult
 	var err error
 
-	start := time.Now()
 	result, err = c.jailbreakInference.Classify(text)
-	metrics.RecordClassifierLatency("jailbreak", time.Since(start).Seconds())
-
 	if err != nil {
 		return false, "", 0.0, fmt.Errorf("jailbreak classification failed: %w", err)
 	}
@@ -673,22 +703,33 @@ type SignalResults struct {
 	MatchedUserFeedbackRules []string // "satisfied", "need_clarification", "wrong_answer", "want_different"
 	MatchedPreferenceRules   []string // Route preference names matched via external LLM
 	MatchedLanguageRules     []string // Language codes: "en", "es", "zh", "fr", etc.
+	MatchedLatencyRules      []string // Latency rule names that matched based on model TPOT
+	MatchedContextRules      []string // Matched context rule names (e.g. "low_token_count")
+	TokenCount               int      // Total token count
 }
 
 // analyzeRuleCombination recursively analyzes rule combinations to find used signals
 func (c *Classifier) analyzeRuleCombination(rules config.RuleCombination, usedSignals map[string]bool) {
 	for _, condition := range rules.Conditions {
-		// Create key in format "type:name"
-		signalKey := condition.Type + ":" + condition.Name
+		// Normalize condition type and name (trim whitespace, lowercase type)
+		// All signal types are normalized to lowercase for consistency with constants
+		// and decision engine switch statements (which all use lowercase)
+		t := strings.ToLower(strings.TrimSpace(condition.Type))
+		n := strings.TrimSpace(condition.Name)
+		signalKey := t + ":" + n
 		usedSignals[signalKey] = true
 	}
 }
 
 // isSignalTypeUsed checks if any signal of the given type is used in decisions
 func isSignalTypeUsed(usedSignals map[string]bool, signalType string) bool {
+	// Normalize signal type for comparison (all signals are normalized to lowercase)
+	normalizedType := strings.ToLower(strings.TrimSpace(signalType))
+	prefix := normalizedType + ":"
+
 	for key := range usedSignals {
-		// Check if the key starts with "signalType:"
-		if len(key) > len(signalType)+1 && key[:len(signalType)+1] == signalType+":" {
+		// All signal keys are normalized to lowercase, so use case-insensitive comparison
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), prefix) {
 			return true
 		}
 	}
@@ -698,6 +739,14 @@ func isSignalTypeUsed(usedSignals map[string]bool, signalType string) bool {
 // EvaluateAllSignals evaluates all signal types and returns SignalResults
 // This is the new method that includes fact_check signals
 func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
+	// For backward compatibility, use the same text for both evaluation and context counting
+	return c.EvaluateAllSignalsWithContext(text, text)
+}
+
+// EvaluateAllSignalsWithContext evaluates all signal types with separate text for context counting
+// text: text to use for signal evaluation (usually latest user message)
+// contextText: text to use for context token counting (usually all messages combined)
+func (c *Classifier) EvaluateAllSignalsWithContext(text string, contextText string) *SignalResults {
 	// Determine which signals (type:name) are actually used in decisions
 	usedSignals := c.getUsedSignals()
 
@@ -713,10 +762,18 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			category, keywords, err := c.keywordClassifier.ClassifyWithKeywords(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeKeyword, category, latencySeconds)
+
 			logging.Infof("[Signal Computation] Keyword signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("keyword rule evaluation failed: %v", err)
 			} else if category != "" {
+				// Record signal match
+				metrics.RecordSignalMatch(config.SignalTypeKeyword, category)
+
 				mu.Lock()
 				results.MatchedKeywordRules = append(results.MatchedKeywordRules, category)
 				results.MatchedKeywords = append(results.MatchedKeywords, keywords...)
@@ -735,10 +792,18 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			category, _, err := c.keywordEmbeddingClassifier.Classify(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeEmbedding, category, latencySeconds)
+
 			logging.Infof("[Signal Computation] Embedding signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("embedding rule evaluation failed: %v", err)
 			} else if category != "" {
+				// Record signal match
+				metrics.RecordSignalMatch(config.SignalTypeEmbedding, category)
+
 				mu.Lock()
 				results.MatchedEmbeddingRules = append(results.MatchedEmbeddingRules, category)
 				mu.Unlock()
@@ -756,22 +821,33 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			result, err := c.categoryInference.Classify(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			var categoryName string
+			if err == nil {
+				// Map class index to category name
+				if name, ok := c.CategoryMapping.GetCategoryFromIndex(result.Class); ok {
+					categoryName = name
+				}
+			}
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeDomain, categoryName, latencySeconds)
+
 			logging.Infof("[Signal Computation] Domain signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("domain rule evaluation failed: %v", err)
-			} else {
-				// Map class index to category name
-				if categoryName, ok := c.CategoryMapping.GetCategoryFromIndex(result.Class); ok {
-					// Only add domain if confidence meets threshold
-					// Without this check, low-confidence misclassifications can still match decisions,
-					// causing incorrect routing for typo-laden text
-					if result.Confidence >= c.Config.CategoryModel.Threshold {
-						if categoryName != "" {
-							mu.Lock()
-							results.MatchedDomainRules = append(results.MatchedDomainRules, categoryName)
-							mu.Unlock()
-						}
-					}
+			} else if result.Confidence >= c.Config.CategoryModel.Threshold {
+				// Only add domain if confidence meets threshold
+				// Without this check, low-confidence misclassifications can still match decisions,
+				// causing incorrect routing for typo-laden text
+				if categoryName != "" {
+					// Record signal match
+					metrics.RecordSignalMatch(config.SignalTypeDomain, categoryName)
+
+					mu.Lock()
+					results.MatchedDomainRules = append(results.MatchedDomainRules, categoryName)
+					mu.Unlock()
 				}
 			}
 		}()
@@ -788,20 +864,27 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			factCheckResult, err := c.ClassifyFactCheck(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Determine which signal to output based on classification result
+			signalName := "no_fact_check_needed"
+			if err == nil && factCheckResult != nil && factCheckResult.NeedsFactCheck {
+				signalName = "needs_fact_check"
+			}
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeFactCheck, signalName, latencySeconds)
+
 			logging.Infof("[Signal Computation] Fact-check signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("fact-check rule evaluation failed: %v", err)
 			} else if factCheckResult != nil {
-				// Determine which signal to output based on classification result
-				// Threshold is already applied in ClassifyFactCheck using fact_check_model.threshold
-				signalName := "no_fact_check_needed"
-				if factCheckResult.NeedsFactCheck {
-					signalName = "needs_fact_check"
-				}
-
 				// Check if this signal is defined in fact_check_rules
 				for _, rule := range c.Config.FactCheckRules {
 					if rule.Name == signalName {
+						// Record signal match
+						metrics.RecordSignalMatch(config.SignalTypeFactCheck, rule.Name)
+
 						mu.Lock()
 						results.MatchedFactCheckRules = append(results.MatchedFactCheckRules, rule.Name)
 						mu.Unlock()
@@ -823,16 +906,27 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			feedbackResult, err := c.ClassifyFeedback(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Use the feedback type directly as the signal name
+			signalName := ""
+			if err == nil && feedbackResult != nil {
+				signalName = feedbackResult.FeedbackType
+			}
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeUserFeedback, signalName, latencySeconds)
+
 			logging.Infof("[Signal Computation] User feedback signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("user feedback rule evaluation failed: %v", err)
 			} else if feedbackResult != nil {
-				// Use the feedback type directly as the signal name
-				signalName := feedbackResult.FeedbackType
-
 				// Check if this signal is defined in user_feedback_rules
 				for _, rule := range c.Config.UserFeedbackRules {
 					if rule.Name == signalName {
+						// Record signal match
+						metrics.RecordSignalMatch(config.SignalTypeUserFeedback, rule.Name)
+
 						mu.Lock()
 						results.MatchedUserFeedbackRules = append(results.MatchedUserFeedbackRules, rule.Name)
 						mu.Unlock()
@@ -857,16 +951,27 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 
 			preferenceResult, err := c.preferenceClassifier.Classify(conversationJSON)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Use the preference name directly as the signal name
+			preferenceName := ""
+			if err == nil && preferenceResult != nil {
+				preferenceName = preferenceResult.Preference
+			}
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypePreference, preferenceName, latencySeconds)
+
 			logging.Infof("[Signal Computation] Preference signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("preference rule evaluation failed: %v", err)
 			} else if preferenceResult != nil {
-				// Use the preference name directly as the signal name
-				preferenceName := preferenceResult.Preference
-
 				// Check if this preference is defined in preference_rules
 				for _, rule := range c.Config.PreferenceRules {
 					if rule.Name == preferenceName {
+						// Record signal match
+						metrics.RecordSignalMatch(config.SignalTypePreference, rule.Name)
+
 						mu.Lock()
 						results.MatchedPreferenceRules = append(results.MatchedPreferenceRules, rule.Name)
 						mu.Unlock()
@@ -889,16 +994,27 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 			start := time.Now()
 			languageResult, err := c.languageClassifier.Classify(text)
 			elapsed := time.Since(start)
+			latencySeconds := elapsed.Seconds()
+
+			// Use the language code directly as the signal name
+			languageCode := ""
+			if err == nil && languageResult != nil {
+				languageCode = languageResult.LanguageCode
+			}
+
+			// Record signal extraction metrics
+			metrics.RecordSignalExtraction(config.SignalTypeLanguage, languageCode, latencySeconds)
+
 			logging.Infof("[Signal Computation] Language signal evaluation completed in %v", elapsed)
 			if err != nil {
 				logging.Errorf("language rule evaluation failed: %v", err)
 			} else if languageResult != nil {
-				// Use the language code directly as the signal name
-				languageCode := languageResult.LanguageCode
-
 				// Check if this language code is defined in language_rules
 				for _, rule := range c.Config.LanguageRules {
 					if rule.Name == languageCode {
+						// Record signal match
+						metrics.RecordSignalMatch(config.SignalTypeLanguage, rule.Name)
+
 						mu.Lock()
 						results.MatchedLanguageRules = append(results.MatchedLanguageRules, rule.Name)
 						mu.Unlock()
@@ -909,6 +1025,80 @@ func (c *Classifier) EvaluateAllSignals(text string) *SignalResults {
 		}()
 	} else if !isSignalTypeUsed(usedSignals, config.SignalTypeLanguage) {
 		logging.Infof("[Signal Computation] Language signal not used in any decision, skipping evaluation")
+	}
+
+	// Evaluate latency rules in parallel (only if used in decisions)
+	// Latency evaluation is model-aware, so we need to collect models from decisions that use latency signals
+	if isSignalTypeUsed(usedSignals, config.SignalTypeLatency) && len(c.Config.LatencyRules) > 0 && c.IsLatencyEnabled() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+
+			// Collect all models from decisions that use latency signals
+			availableModels := c.collectModelsForLatencySignals(usedSignals)
+
+			if len(availableModels) > 0 {
+				latencyResult, err := c.latencyClassifier.Classify(availableModels)
+				elapsed := time.Since(start)
+				latencySeconds := elapsed.Seconds()
+
+				// Record signal extraction metrics for each matched latency rule
+				if err == nil && latencyResult != nil {
+					for _, ruleName := range latencyResult.MatchedRules {
+						metrics.RecordSignalExtraction(config.SignalTypeLatency, ruleName, latencySeconds)
+						metrics.RecordSignalMatch(config.SignalTypeLatency, ruleName)
+					}
+				} else {
+					// Record extraction even if no match
+					metrics.RecordSignalExtraction(config.SignalTypeLatency, "", latencySeconds)
+				}
+
+				logging.Infof("[Signal Computation] Latency signal evaluation completed in %v", elapsed)
+				if err != nil {
+					logging.Errorf("latency rule evaluation failed: %v", err)
+				} else if latencyResult != nil {
+					mu.Lock()
+					results.MatchedLatencyRules = latencyResult.MatchedRules
+					mu.Unlock()
+				}
+			} else if isSignalTypeUsed(usedSignals, config.SignalTypeLatency) {
+				// Diagnostic: latency signals are used but no models found
+				// This can happen if decisions reference latency signals but have no ModelRefs
+				latencySignals := []string{}
+				for key := range usedSignals {
+					if strings.HasPrefix(strings.ToLower(key), config.SignalTypeLatency+":") {
+						latencySignals = append(latencySignals, key)
+					}
+				}
+				logging.Warnf("[Signal Computation] Latency signals are used (%v) but no models found in decisions. Latency routing will be skipped.", latencySignals)
+			}
+		}()
+	} else if !isSignalTypeUsed(usedSignals, config.SignalTypeLatency) {
+		logging.Infof("[Signal Computation] Latency signal not used in any decision, skipping evaluation")
+	}
+
+	// Evaluate context rules in parallel (only if used in decisions)
+	// Use contextText for token counting to include all messages in multi-turn conversations
+	if isSignalTypeUsed(usedSignals, config.SignalTypeContext) && c.contextClassifier != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			matchedRules, count, err := c.contextClassifier.Classify(contextText)
+			elapsed := time.Since(start)
+			logging.Infof("[Signal Computation] Context signal evaluation completed in %v (count=%d)", elapsed, count)
+			if err != nil {
+				logging.Errorf("context rule evaluation failed: %v", err)
+			} else {
+				mu.Lock()
+				results.MatchedContextRules = matchedRules
+				results.TokenCount = count
+				mu.Unlock()
+			}
+		}()
+	} else if !isSignalTypeUsed(usedSignals, config.SignalTypeContext) {
+		logging.Infof("[Signal Computation] Context signal not used in any decision, skipping evaluation")
 	}
 
 	// Wait for all signal evaluations to complete
@@ -925,10 +1115,10 @@ func (c *Classifier) EvaluateDecisionWithEngine(signals *SignalResults) (*decisi
 		return nil, fmt.Errorf("no decisions configured")
 	}
 
-	logging.Infof("Signal evaluation results: keyword=%v, embedding=%v, domain=%v, fact_check=%v, user_feedback=%v, preference=%v, language=%v",
+	logging.Infof("Signal evaluation results: keyword=%v, embedding=%v, domain=%v, fact_check=%v, user_feedback=%v, preference=%v, language=%v, latency=%v, context=%v",
 		signals.MatchedKeywordRules, signals.MatchedEmbeddingRules, signals.MatchedDomainRules,
 		signals.MatchedFactCheckRules, signals.MatchedUserFeedbackRules, signals.MatchedPreferenceRules,
-		signals.MatchedLanguageRules)
+		signals.MatchedLanguageRules, signals.MatchedLatencyRules, signals.MatchedContextRules)
 	// Create decision engine
 	engine := decision.NewDecisionEngine(
 		c.Config.KeywordRules,
@@ -947,6 +1137,8 @@ func (c *Classifier) EvaluateDecisionWithEngine(signals *SignalResults) (*decisi
 		UserFeedbackRules: signals.MatchedUserFeedbackRules,
 		PreferenceRules:   signals.MatchedPreferenceRules,
 		LanguageRules:     signals.MatchedLanguageRules,
+		LatencyRules:      signals.MatchedLatencyRules,
+		ContextRules:      signals.MatchedContextRules,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("decision evaluation failed: %w", err)
@@ -1050,10 +1242,7 @@ func (c *Classifier) classifyCategoryWithEntropyInTree(text string) (string, flo
 	var result candle_binding.ClassResultWithProbs
 	var err error
 
-	start := time.Now()
 	result, err = c.categoryInference.ClassifyWithProbabilities(text)
-	metrics.RecordClassifierLatency("category", time.Since(start).Seconds())
-
 	if err != nil {
 		return "", 0.0, entropy.ReasoningDecision{}, fmt.Errorf("classification error: %w", err)
 	}
@@ -1158,8 +1347,8 @@ func (c *Classifier) classifyCategoryWithEntropyInTree(text string) (string, flo
 		logging.Infof("Classification confidence (%.4f) below threshold (%.4f), falling back to category: %s",
 			result.Confidence, c.Config.CategoryModel.Threshold, fallbackCategory)
 
-		// Record the fallback category classification metric
-		metrics.RecordCategoryClassification(fallbackCategory)
+		// Record the fallback category as a signal match
+		metrics.RecordSignalMatch(config.SignalTypeKeyword, fallbackCategory)
 
 		// Return fallback category instead of empty string to enable proper decision routing
 		return fallbackCategory, float64(result.Confidence), reasoningDecision, nil
@@ -1175,13 +1364,13 @@ func (c *Classifier) classifyCategoryWithEntropyInTree(text string) (string, flo
 		}
 
 		logging.Warnf("Class index %d not found in category mapping, falling back to: %s", result.Class, fallbackCategory)
-		metrics.RecordCategoryClassification(fallbackCategory)
+		metrics.RecordSignalMatch(config.SignalTypeKeyword, fallbackCategory)
 		return fallbackCategory, float64(result.Confidence), reasoningDecision, nil
 	}
 	genericCategory := c.translateMMLUToGeneric(categoryName)
 
-	// Record the category classification metric
-	metrics.RecordCategoryClassification(genericCategory)
+	// Record the category as a signal match
+	metrics.RecordSignalMatch(config.SignalTypeKeyword, genericCategory)
 
 	logging.Infof("Classified as category: %s (mmlu=%s), reasoning_decision: use=%t, confidence=%.3f, reason=%s",
 		genericCategory, categoryName, reasoningDecision.UseReasoning, reasoningDecision.Confidence, reasoningDecision.DecisionReason)
@@ -1206,9 +1395,7 @@ func (c *Classifier) ClassifyPIIWithThreshold(text string, threshold float32) ([
 
 	// Use ModernBERT PII token classifier for entity detection
 	configPath := fmt.Sprintf("%s/config.json", c.Config.PIIModel.ModelID)
-	start := time.Now()
 	tokenResult, err := c.piiInference.ClassifyTokens(text, configPath)
-	metrics.RecordClassifierLatency("pii", time.Since(start).Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("PII token classification error: %w", err)
 	}
@@ -1260,9 +1447,7 @@ func (c *Classifier) ClassifyPIIWithDetailsAndThreshold(text string, threshold f
 
 	// Use PII token classifier for entity detection
 	configPath := fmt.Sprintf("%s/config.json", c.Config.PIIModel.ModelID)
-	start := time.Now()
 	tokenResult, err := c.piiInference.ClassifyTokens(text, configPath)
-	metrics.RecordClassifierLatency("pii", time.Since(start).Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("PII token classification error: %w", err)
 	}
@@ -1360,9 +1545,7 @@ func (c *Classifier) AnalyzeContentForPIIWithThreshold(contentList []string, thr
 
 		// Use ModernBERT PII token classifier for detailed analysis
 		configPath := fmt.Sprintf("%s/config.json", c.Config.PIIModel.ModelID)
-		start := time.Now()
 		tokenResult, err := c.piiInference.ClassifyTokens(content, configPath)
-		metrics.RecordClassifierLatency("pii", time.Since(start).Seconds())
 		if err != nil {
 			logging.Errorf("Error analyzing content %d: %v", i, err)
 			continue
@@ -1563,6 +1746,71 @@ func (c *Classifier) GetModelsForCategory(categoryName string) []string {
 	return models
 }
 
+// collectModelsForLatencySignals collects all models from decisions that use latency signals
+func (c *Classifier) collectModelsForLatencySignals(usedSignals map[string]bool) []string {
+	modelSet := make(map[string]bool)
+
+	for i := range c.Config.Decisions {
+		decision := &c.Config.Decisions[i]
+		// Check if this decision uses latency signals
+		usesLatency := false
+		// usedSignals keys are already normalized to lowercase by analyzeRuleCombination
+		latencyPrefix := config.SignalTypeLatency + ":"
+		for key := range usedSignals {
+			if strings.HasPrefix(key, latencyPrefix) {
+				// Check if this decision's rules reference this latency signal
+				// decisionUsesLatencySignal normalizes condition.Type/Name from config
+				if c.decisionUsesLatencySignal(decision, key) {
+					usesLatency = true
+					break
+				}
+			}
+		}
+
+		if usesLatency {
+			// Collect models from this decision
+			for _, modelRef := range decision.ModelRefs {
+				modelName := ""
+				if modelRef.LoRAName != "" {
+					modelName = modelRef.LoRAName
+				} else {
+					modelName = modelRef.Model
+				}
+				// Skip empty model names
+				if modelName != "" {
+					modelSet[modelName] = true
+				}
+			}
+		}
+	}
+
+	// Convert set to slice and sort deterministically
+	var models []string
+	for model := range modelSet {
+		models = append(models, model)
+	}
+	// Sort deterministically to ensure consistent ordering
+	slices.Sort(models)
+
+	return models
+}
+
+// decisionUsesLatencySignal checks if a decision uses a latency signal key
+// condition.Type and condition.Name come from config, so we normalize them for comparison
+func (c *Classifier) decisionUsesLatencySignal(decision *config.Decision, normalizedSignalKey string) bool {
+	for _, condition := range decision.Rules.Conditions {
+		// Normalize condition from config for comparison (all signals are normalized to lowercase)
+		normalizedType := strings.ToLower(strings.TrimSpace(condition.Type))
+		if normalizedType == config.SignalTypeLatency {
+			currentKey := normalizedType + ":" + strings.ToLower(strings.TrimSpace(condition.Name))
+			if currentKey == normalizedSignalKey {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // updateBestModel updates the best model, score if the new score is better.
 func (c *Classifier) updateBestModel(score float64, model string, bestScore *float64, bestModel *string) {
 	if score > *bestScore {
@@ -1710,6 +1958,27 @@ func (c *Classifier) initializeLanguageClassifier() error {
 	c.languageClassifier = classifier
 	logging.Infof("Language classifier initialized")
 	return nil
+}
+
+// initializeLatencyClassifier initializes the latency classifier
+func (c *Classifier) initializeLatencyClassifier() error {
+	if len(c.Config.LatencyRules) == 0 {
+		return nil
+	}
+
+	classifier, err := NewLatencyClassifier(c.Config.LatencyRules)
+	if err != nil {
+		return fmt.Errorf("failed to create latency classifier: %w", err)
+	}
+
+	c.latencyClassifier = classifier
+	logging.Infof("Latency classifier initialized")
+	return nil
+}
+
+// IsLatencyEnabled checks if latency classification is enabled
+func (c *Classifier) IsLatencyEnabled() bool {
+	return len(c.Config.LatencyRules) > 0 && c.latencyClassifier != nil
 }
 
 // ClassifyFactCheck performs fact-check classification on the given text

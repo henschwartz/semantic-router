@@ -9,7 +9,7 @@
 ![Test And Build](https://github.com/vllm-project/semantic-router/workflows/Test%20And%20Build/badge.svg)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/vllm-project/semantic-router)
 
-**📚 [Complete Documentation](https://vllm-semantic-router.com) | 🚀 [Quick Start](https://vllm-semantic-router.com/docs/installation) | 📣 [Blog](https://vllm-semantic-router.com/blog/) | 📖 [Publications](https://vllm-semantic-router.com/publications/)**
+**🎯 [Playground](https://play.vllm-semantic-router.com) | 📚 [Website](https://vllm-semantic-router.com) | 🚀 [Quick Start](https://vllm-semantic-router.com/docs/installation) | 📣 [Blog](https://vllm-semantic-router.com/blog/) | 📖 [Publications](https://vllm-semantic-router.com/publications/)**
 
 </div>
 
@@ -132,7 +132,7 @@ Complete Documentation at Read the **[Docs](https://vllm-semantic-router.com/)**
 The documentation includes:
 
 - **[Installation Guide](https://vllm-semantic-router.com/docs/installation/)** - Complete setup instructions
-- **[System Architecture](https://vllm-semantic-router.com/docs/overview/architecture/system-architecture/)** - Technical deep dive
+- **[System Architecture](https://vllm-semantic-router.com/docs/intro/#architecture-overview)** - Technical deep dive
 - **[Model Training](https://vllm-semantic-router.com/docs/training/training-overview/)** - How classification models work
 - **[API Reference](https://vllm-semantic-router.com/docs/api/router/)** - Complete API documentation
 

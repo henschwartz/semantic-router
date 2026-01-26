@@ -24,6 +24,15 @@ type Config struct {
 
 	// Read-only mode for public beta deployments
 	ReadonlyMode bool
+
+	// Platform branding (e.g., "amd" for AMD GPU deployments)
+	Platform string
+
+	// Evaluation configuration
+	EvaluationEnabled    bool
+	EvaluationDBPath     string
+	EvaluationResultsDir string
+	PythonPath           string
 }
 
 // env returns the env var or default
@@ -54,6 +63,15 @@ func LoadConfig() (*Config, error) {
 	// Read-only mode for public beta deployments
 	readonlyMode := flag.Bool("readonly", env("DASHBOARD_READONLY", "false") == "true", "enable read-only mode (disable config editing)")
 
+	// Platform branding
+	platform := flag.String("platform", env("DASHBOARD_PLATFORM", ""), "platform branding (e.g., 'amd' for AMD GPU deployments)")
+
+	// Evaluation configuration
+	evaluationEnabled := flag.Bool("evaluation", env("EVALUATION_ENABLED", "true") == "true", "enable evaluation feature")
+	evaluationDBPath := flag.String("evaluation-db", env("EVALUATION_DB_PATH", "./data/evaluations.db"), "evaluation database path")
+	evaluationResultsDir := flag.String("evaluation-results", env("EVALUATION_RESULTS_DIR", "./data/results"), "evaluation results directory")
+	pythonPath := flag.String("python", env("PYTHON_PATH", "python3"), "path to Python interpreter")
+
 	flag.Parse()
 
 	cfg.Port = *port
@@ -66,6 +84,11 @@ func LoadConfig() (*Config, error) {
 	cfg.JaegerURL = *jaegerURL
 	cfg.EnvoyURL = *envoyURL
 	cfg.ReadonlyMode = *readonlyMode
+	cfg.Platform = *platform
+	cfg.EvaluationEnabled = *evaluationEnabled
+	cfg.EvaluationDBPath = *evaluationDBPath
+	cfg.EvaluationResultsDir = *evaluationResultsDir
+	cfg.PythonPath = *pythonPath
 
 	// Resolve config file path to absolute path
 	absConfigPath, err := filepath.Abs(cfg.ConfigFile)

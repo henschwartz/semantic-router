@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
@@ -34,6 +36,8 @@ const (
 	SignalTypeUserFeedback = "user_feedback"
 	SignalTypePreference   = "preference"
 	SignalTypeLanguage     = "language"
+	SignalTypeLatency      = "latency"
+	SignalTypeContext      = "context"
 )
 
 // API format constants for model backends
@@ -316,6 +320,14 @@ type Signals struct {
 	// Language rules for multi-language detection signal classification
 	// When matched, outputs the detected language code (e.g., "en", "es", "zh", "fr")
 	LanguageRules []LanguageRule `yaml:"language_rules,omitempty"`
+
+	// Latency rules for latency-based signal classification
+	// When matched, outputs the latency rule name if available models meet TPOT requirements
+	LatencyRules []LatencyRule `yaml:"latency_rules,omitempty"`
+
+	// Context rules for token count-based classification
+	// When matched, outputs the rule name (e.g., "low_token_count", "high_token_count")
+	ContextRules []ContextRule `yaml:"context_rules,omitempty"`
 }
 
 // BackendModels represents the configuration for backend models
@@ -1060,6 +1072,37 @@ type HallucinationModelConfig struct {
 
 	// Use CPU for inference
 	UseCPU bool `yaml:"use_cpu"`
+
+	// Minimum span length (in tokens) to consider for hallucination detection
+	// Helps reduce false positives from single-token mismatches
+	// Default: 1
+	MinSpanLength int `yaml:"min_span_length,omitempty"`
+
+	// MinSpanConfidence is the minimum average confidence (0.0–1.0)
+	// required for a span to be considered non-hallucinated.
+	// Spans with average confidence below this threshold are flagged
+	// as potential hallucinations.
+	// Default: 0.0 (disable span confidence filtering)
+	MinSpanConfidence float32 `yaml:"min_span_confidence,omitempty"`
+
+	// Context window size for span extraction (in tokens)
+	// Provides additional context around detected spans for better accuracy
+	// Default: 50
+	ContextWindowSize int `yaml:"context_window_size,omitempty"`
+
+	// EnableNLIFiltering enables NLI-based false positive filtering.
+	// When enabled, an NLI model verifies whether detected hallucination
+	// spans are actually unsupported by the surrounding context,
+	// reducing false positives.
+	// Default: false
+	EnableNLIFiltering bool `yaml:"enable_nli_filtering,omitempty"`
+
+	// NLIEntailmentThreshold is the confidence threshold (0.0-1.0)
+	// for NLI entailment when filtering hallucination spans.
+	// Spans with NLI entailment confidence above this threshold
+	// are considered supported by context and not hallucinations.
+	// Default: 0.75
+	NLIEntailmentThreshold float32 `yaml:"nli_entailment_threshold,omitempty"`
 }
 
 // NLIModelConfig represents configuration for the NLI (Natural Language Inference) model
@@ -1773,6 +1816,57 @@ type LanguageRule struct {
 
 	// Description provides human-readable explanation of the language
 	Description string `yaml:"description,omitempty"`
+}
+
+// LatencyRule defines a rule for latency-based signal classification
+// The latency classifier evaluates if available models meet TPOT (Time Per Output Token) requirements
+type LatencyRule struct {
+	// Name is the latency rule name that can be referenced in decision rules
+	Name string `yaml:"name"`
+
+	// MaxTPOT is the maximum acceptable TPOT (Time Per Output Token) in seconds
+	// Models with TPOT <= MaxTPOT will match this rule
+	// Example: 0.05 means 50ms per token
+	MaxTPOT float64 `yaml:"max_tpot"`
+
+	// Description provides human-readable explanation of the latency requirement
+	Description string `yaml:"description,omitempty"`
+}
+
+// TokenCount represents a token count value with optional K/M suffixes
+type TokenCount string
+
+// Value parses the token count string into an integer
+func (t TokenCount) Value() (int, error) {
+	s := string(t)
+	if s == "" {
+		return 0, nil
+	}
+	s = strings.ToUpper(strings.TrimSpace(s))
+
+	multiplier := 1.0
+	if strings.HasSuffix(s, "K") {
+		multiplier = 1000.0
+		s = strings.TrimSuffix(s, "K")
+	} else if strings.HasSuffix(s, "M") {
+		multiplier = 1000000.0
+		s = strings.TrimSuffix(s, "M")
+	}
+
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid token count format: %s", t)
+	}
+
+	return int(val * multiplier), nil
+}
+
+// ContextRule defines a rule for context-based (token count) classification
+type ContextRule struct {
+	Name        string     `yaml:"name"`
+	MinTokens   TokenCount `yaml:"min_tokens"`
+	MaxTokens   TokenCount `yaml:"max_tokens"`
+	Description string     `yaml:"description,omitempty"`
 }
 
 // ModelReasoningControl represents reasoning mode control on model level
