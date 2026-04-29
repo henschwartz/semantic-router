@@ -242,11 +242,11 @@ func cloneProjectionTraceRecord(t *projectiontrace.Trace) *projectiontrace.Trace
 	}
 	b, err := json.Marshal(t)
 	if err != nil {
-		return t
+		return nil
 	}
 	var out projectiontrace.Trace
 	if err := json.Unmarshal(b, &out); err != nil {
-		return t
+		return nil
 	}
 	return &out
 }

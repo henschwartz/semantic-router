@@ -152,11 +152,13 @@ func cloneProjectionTraceForReplay(t *projectiontrace.Trace) *projectiontrace.Tr
 	}
 	b, err := json.Marshal(t)
 	if err != nil {
-		return t
+		logging.Warnf("failed to clone projection trace for replay during marshal: %v", err)
+		return nil
 	}
 	var out projectiontrace.Trace
 	if err := json.Unmarshal(b, &out); err != nil {
-		return t
+		logging.Warnf("failed to clone projection trace for replay during unmarshal: %v", err)
+		return nil
 	}
 	return &out
 }

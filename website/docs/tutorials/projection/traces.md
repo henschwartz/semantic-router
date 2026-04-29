@@ -6,7 +6,7 @@ sidebar_position: 5
 
 ## Overview
 
-When [router replay](../../installation/configuration.md) captures routing records, each record can include a structured **`projection_trace`** field (JSON) in addition to `projections` (matched output names) and `projection_scores` (aggregated numeric scores).
+When [router replay](../../installation/configuration) captures routing records, each record can include a structured **`projection_trace`** field (JSON) in addition to `projections` (matched output names) and `projection_scores` (aggregated numeric scores).
 
 The trace explains *how* partition reduction, weighted scores, and mapping thresholds behaved for that request—so operators and dashboard users can debug routing without inferring internals from scalar scores alone.
 
@@ -32,7 +32,7 @@ Matched projection names (`projections`) and numeric summaries (`projection_scor
 
 Explainability payloads are emitted when projections are evaluated; storage depends on replay backend configuration:
 
-- Enable replay with the persistence settings described in **[Router replay configuration](../../installation/configuration.md)**.
+- Enable replay with the persistence settings described in **[Router replay configuration](../../installation/configuration)**.
 - For PostgreSQL, ensure migrations include column **`projection_trace`** (JSONB) alongside **`projections`** and **`projection_scores`**.
 
 There is no separate “trace on/off” switch—tracing is implicit whenever projections run and the recorder persists the enriched `SignalResults`/`Record`.
