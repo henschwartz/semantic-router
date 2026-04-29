@@ -1,11 +1,13 @@
 package extproc
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/projectiontrace"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/promptcompression"
 )
 
@@ -128,6 +130,7 @@ func (r *OpenAIRouter) applySignalResultsToContext(ctx *RequestContext, signals 
 	ctx.VSRProjectionScores = cloneReplayFloat64Map(signals.ProjectionScores)
 	ctx.VSRSignalConfidences = cloneReplayFloat64Map(signals.SignalConfidences)
 	ctx.VSRSignalValues = cloneReplayFloat64Map(signals.SignalValues)
+	ctx.VSRProjectionTrace = cloneProjectionTraceForReplay(signals.ProjectionTrace)
 
 	if signals.JailbreakDetected {
 		ctx.JailbreakDetected = signals.JailbreakDetected
@@ -141,6 +144,21 @@ func (r *OpenAIRouter) applySignalResultsToContext(ctx *RequestContext, signals 
 
 	r.setFactCheckFromSignals(ctx, signals.MatchedFactCheckRules)
 	r.setModalityFromSignals(ctx, signals.MatchedModalityRules)
+}
+
+func cloneProjectionTraceForReplay(t *projectiontrace.Trace) *projectiontrace.Trace {
+	if t == nil {
+		return nil
+	}
+	b, err := json.Marshal(t)
+	if err != nil {
+		return t
+	}
+	var out projectiontrace.Trace
+	if err := json.Unmarshal(b, &out); err != nil {
+		return t
+	}
+	return &out
 }
 
 func cloneReplayFloat64Map(values map[string]float64) map[string]float64 {
